@@ -412,7 +412,7 @@ class PID:
         return output
 
 class AStar():
-    def __init__(self, G):
+    def __init__(self, G, is_blocked=None):
         self.G = G                          # Tree
         self.q = Queue([])                  # open set
         self.closed = set()                 # closed set（可选）
@@ -420,6 +420,8 @@ class AStar():
         self.dist = {name: float('inf') for name in self.G.g.keys()}  # g(n)
         self.via  = {name: None for name in self.G.g.keys()}
         self.fscore = {name: float('inf') for name in self.G.g.keys()} # f(n)
+
+        self.is_blocked = is_blocked
 
     def __parse_name_to_ij(self, name):
         # name 格式如 "i,j"
@@ -463,6 +465,10 @@ class AStar():
 
             # 扩展邻居
             for i, c in enumerate(u.children):
+
+                if self.is_blocked is not None and self.is_blocked(c.name):
+                    continue
+
                 w = u.weight[i]
                 tentative_g = self.dist[u_name] + w
                 if tentative_g < self.dist[c.name]:
@@ -549,7 +555,17 @@ class PathFinder():
         self.node.get_logger().info('Start: {}, End: {}'.format(self.mp.map_graph.root, self.mp.map_graph.end))
         #self.node.get_logger().info('Start: {}, End: {}'.format(self.mp.map_graph.root, self.mp.map_graph.end))
         
-        as_maze = AStar(self.mp.map_graph)
+        def is_blocked(name: str) -> bool:
+            i, j = map(int, name.split(','))  # name 形式是 "i,j" = "row,col"
+            # 边界保护（理论上不会越界，但习惯性防一手）
+            if i < 0 or i >= self.mp.inf_map_img_array.shape[0]:
+                return True
+            if j < 0 or j >= self.mp.inf_map_img_array.shape[1]:
+                return True
+            # 只看动态 costmap：1 表示有障碍
+            return self.dynamic_costmap[i, j] != 0
+
+        as_maze = AStar(self.mp.map_graph, is_blocked=is_blocked)
         as_maze.solve(self.mp.map_graph.g[self.mp.map_graph.root],self.mp.map_graph.g[self.mp.map_graph.end])
         path_as,dist_as = as_maze.reconstruct_path(self.mp.map_graph.g[self.mp.map_graph.root],self.mp.map_graph.g[self.mp.map_graph.end])
         
@@ -626,6 +642,9 @@ class Navigation(rclpy_node):
         
         self.is_goal_set = False
 
+        self._current_path = None
+        self._last_plan_time = None
+        self.replan_interval = 10
     def __goal_pose_cbk(self, data):
         """! Callback to catch the goal pose.
         @param  data    PoseStamped object from RVIZ.
@@ -688,7 +707,7 @@ class Navigation(rclpy_node):
                 dyn[pix_y, pix_x] = 1
 
                 # ---------- 可选：简单膨胀一圈 ----------
-                inflation = 1   # 半径 1 cell，可自行调大
+                inflation = 5   # 半径 1 cell，可自行调大
                 for dy in range(-inflation, inflation + 1):
                     for dx in range(-inflation, inflation + 1):
                         ny, nx = pix_y + dy, pix_x + dx
@@ -837,15 +856,42 @@ class Navigation(rclpy_node):
         self.cmd_vel_pub.publish(cmd_vel)
 
     def _loop_once(self):
-         # 1. 如果收到了新 goal，就规划
+        now = self.get_clock().now()
+
+        # 1. 收到新的 goal：从当前位置到新 goal 规划一次
         if self.is_goal_set:
             self.is_goal_set = False
             path = self.a_star_path_planner(self.ttbot_pose, self.goal_pose)
-            self._current_path = path  # 保存
+            self._current_path = path
+            self._last_plan_time = now
 
-        # 2. 按路径跟踪
-        path = getattr(self, "_current_path", None)
-        if path and path.poses != []:
+        # 2. 没有 goal 就啥也不干
+        if not hasattr(self, "goal_pose") or self.goal_pose is None:
+            return
+
+        # 3. 如果已经到 goal 附近了，就停下
+        goal_dx = self.goal_pose.pose.position.x - self.ttbot_pose.pose.position.x
+        goal_dy = self.goal_pose.pose.position.y - self.ttbot_pose.pose.position.y
+        goal_dist = np.hypot(goal_dx, goal_dy)
+        if goal_dist < 0.1:  # 10cm 以内认为到达
+            self.move_ttbot(0.0, 0.0)
+            return
+
+        # 4. 周期性重规划（利用最新 amcl_pose + costmap）
+        if self._last_plan_time is None:
+            need_replan = True
+        else:
+            dt = (now.nanoseconds - self._last_plan_time.nanoseconds) * 1e-9
+            need_replan = dt > self.replan_interval
+
+        if need_replan:
+            path = self.a_star_path_planner(self.ttbot_pose, self.goal_pose)
+            self._current_path = path
+            self._last_plan_time = now
+
+        # 5. 按当前路径跟踪
+        path = self._current_path
+        if path and path.poses:
             idx = self.get_path_idx(path, self.ttbot_pose)
             current_goal = path.poses[idx]
             speed, heading = self.path_follower(self.ttbot_pose, current_goal)
