@@ -7,6 +7,11 @@ from rclpy.node import Node as rclpy_node
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Pose, Twist
 from std_msgs.msg import Float32
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import OccupancyGrid
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
+
 import ament_index_python.packages
 import time
 import heapq
@@ -499,15 +504,18 @@ class PathFinder():
         self.mp.get_graph_from_map()
         self.node.get_logger().info('Map: ' + map_name + 'loaded.')
 
+        self.dynamic_costmap = np.zeros_like(self.mp.inf_map_img_array, dtype=np.uint8)
+
+
     # change the scale of the map, from world to pixel map
-    def world_to_pixel(self, x, y, min_x=-5.4, max_y=4.2, scale_x=13.42, scale_y=13.49)->tuple[int,int]:
+    def world_to_pixel(self, x, y, clamp=False)->tuple[int,int]:
         # x_origin, y_origin = 73, 56 # sim: 73, 56 
         # resolution = 1/0.075 # sim: 0.075 
         # pixel_x = x_origin + x * resolution
         # pixel_y = y_origin - y * resolution
         
         # return int(round(pixel_x)), int(round(pixel_y))
-        return self.mp.map.pose_to_grid(x, y)
+        return self.mp.map.pose_to_grid(x, y,clamp=clamp)
     
     def pixel_to_world(self, pixel_x, pixel_y, min_x=-5.4, max_y=4.2, scale_x=0.0745, scale_y=0.0741)->tuple:
         # x_origin, y_origin = 72, 56 
@@ -598,11 +606,13 @@ class Navigation(rclpy_node):
         self.create_subscription(PoseStamped, '/move_base_simple/goal', self.__goal_pose_cbk, 10)
         self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self.__ttbot_pose_cbk, 10)
 
+        self.create_subscription(LaserScan, '/scan', self.__laser_cbk, 10)
+
         # Publishers
         self.path_pub = self.create_publisher(Path, 'global_plan', 10)
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
         self.calc_time_pub = self.create_publisher(Float32, 'astar_time',10) #DO NOT MODIFY
-
+        self.costmap_marker_pub = self.create_publisher(MarkerArray, 'dynamic_costmap_markers', 1)
         # Node rate
         self.rate = self.create_rate(10)
 
@@ -634,7 +644,103 @@ class Navigation(rclpy_node):
         self.ttbot_pose = data.pose
         self.get_logger().info(
             'ttbot_pose: {:.4f}, {:.4f}'.format(self.ttbot_pose.pose.position.x, self.ttbot_pose.pose.position.y))
+        
+    def __laser_cbk(self, msg: LaserScan):
+        """根据激光雷达数据更新动态 costmap（PathFinder.dynamic_costmap）"""
+        # 1. 没有定位信息就先不更新
+        if self.ttbot_pose is None:
+            return
 
+        # 2. 清空上一帧的动态障碍（简单做法：每帧重置）
+        dyn = self.PathFinder.dynamic_costmap
+        dyn.fill(0)
+
+        # 3. 机器人当前位姿（map 坐标系下）
+        rx = self.ttbot_pose.pose.position.x
+        ry = self.ttbot_pose.pose.position.y
+        q = self.ttbot_pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+
+        # 4. 遍历每一条激光束
+        angle = msg.angle_min
+        for r in msg.ranges:
+            # 距离合法性检查
+            if np.isinf(r) or np.isnan(r):
+                angle += msg.angle_increment
+                continue
+            if r < msg.range_min or r > msg.range_max:
+                angle += msg.angle_increment
+                continue
+
+            # 激光坐标系下的点（假设雷达和 base_link 重合，且在机器人中心）
+            x_l = r * np.cos(angle)
+            y_l = r * np.sin(angle)
+
+            # 旋转 + 平移到 map/world 坐标系
+            x_w = rx + np.cos(yaw) * x_l - np.sin(yaw) * y_l
+            y_w = ry + np.sin(yaw) * x_l + np.cos(yaw) * y_l
+
+            # world -> 像素坐标（列=像素 x，行=像素 y）
+            pix_x, pix_y = self.PathFinder.world_to_pixel(x_w, y_w,True)
+
+            # 写入 dynamic_costmap （注意索引 [row, col] = [y, x]）
+            if 0 <= pix_y < dyn.shape[0] and 0 <= pix_x < dyn.shape[1]:
+                dyn[pix_y, pix_x] = 1
+
+                # ---------- 可选：简单膨胀一圈 ----------
+                inflation = 1   # 半径 1 cell，可自行调大
+                for dy in range(-inflation, inflation + 1):
+                    for dx in range(-inflation, inflation + 1):
+                        ny, nx = pix_y + dy, pix_x + dx
+                        if 0 <= ny < dyn.shape[0] and 0 <= nx < dyn.shape[1]:
+                            dyn[ny, nx] = 1
+                # ---------------------------------------
+
+            angle += msg.angle_increment
+        self.publish_dynamic_costmap_markers()
+    def publish_dynamic_costmap_markers(self):
+        dyn = self.PathFinder.dynamic_costmap
+        h, w = dyn.shape
+
+        ma = MarkerArray()
+
+        # 用一个 CUBE_LIST marker 把所有障碍画出来
+        m = Marker()
+        m.header.frame_id = 'map'
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = 'dynamic_costmap'
+        m.id = 0
+        m.type = Marker.CUBE_LIST  # 一堆小方块
+        m.action = Marker.ADD
+
+        # 尺寸：用地图分辨率
+        res = float(self.PathFinder.mp.map.map_df.resolution[0])
+        m.scale.x = res
+        m.scale.y = res
+        m.scale.z = 0.02  # 薄薄一层就行
+
+        # 颜色：红色，半透明一点
+        m.color.r = 1.0
+        m.color.g = 0.0
+        m.color.b = 0.0
+        m.color.a = 0.6
+
+        # 用你自己的 pixel_to_world 来处理坐标，这里 Y 翻转自然跟你当前程序一致
+        for i in range(h):       # i = row = 像素 y
+            for j in range(w):   # j = col = 像素 x
+                if dyn[i, j] == 0:
+                    continue
+
+                world_x, world_y = self.PathFinder.pixel_to_world(j, i)
+
+                p = Point()
+                p.x = float(world_x)
+                p.y = float(world_y)
+                p.z = 0.01  # 稍微抬一点
+                m.points.append(p)
+
+        ma.markers.append(m)
+        self.costmap_marker_pub.publish(ma)
     def a_star_path_planner(self, start_pose, end_pose):
         """! A Start path planner.
         @param  start_pose    PoseStamped object containing the start of the path to be created.
