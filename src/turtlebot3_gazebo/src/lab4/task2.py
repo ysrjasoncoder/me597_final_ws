@@ -104,11 +104,57 @@ class Tree():
         self.root = False
         self.end = True
 
+import yaml
+from PIL import Image
+from dataclasses import dataclass
+from math import radians
+from math import cos, sin, floor
+@dataclass
+class MapInfo:
+    resolution: float
+    width: int
+    height: int
+    origin_x: float
+    origin_y: float
+    origin_yaw: float = 0.0
+    y_down: bool = False
+
+def load_map_info_from_yaml(yaml_path, y_down=False):
+    """
+    从ROS地图YAML文件中加载地图元数据（resolution, origin, width, height）
+    并返回 MapInfo 对象。
+    """
+    # 1. 解析 YAML 文件
+    with open(yaml_path, 'r') as f:
+        data = yaml.safe_load(f)
+
+    image_path = data['image']
+    resolution = float(data['resolution'])
+    origin = data['origin']          # [x, y, yaw]
+    origin_x, origin_y, origin_yaw = origin
+
+    # 2. 打开 .pgm 图像获取宽高
+    img = Image.open(yaml_path.replace('yaml','pgm'))
+    width, height = img.size  # 注意：Pillow 返回 (width, height)
+
+    # 3. 构建 MapInfo 对象
+    map_info = MapInfo(
+        resolution=resolution,
+        width=width,
+        height=height,
+        origin_x=origin_x,
+        origin_y=origin_y,
+        origin_yaw=origin_yaw,  # 通常为0
+        y_down=y_down
+    )
+
+    return map_info
 
 class Map():
     def __init__(self, map_yaml_path):
         self.map_im, self.map_df, self.limits = self.__open_map(map_yaml_path)
         self.image_array = self.__get_obstacle_map(self.map_im, self.map_df)
+        self.mpInfo = load_map_info_from_yaml(map_yaml_path, y_down=True)
 
 
     def __open_map(self,map_yaml_path):
@@ -120,9 +166,9 @@ class Map():
         pgm_file  = map_df.image[0]
         pgm_file_path = map_yaml_path.replace('yaml','pgm')
         im = Image.open(pgm_file_path)
-        size = 200, 200
-        im.thumbnail(size)
-        im = ImageOps.grayscale(im)
+        # size = 200, 200
+        # im.thumbnail(size)
+        # im = ImageOps.grayscale(im)
         # Get the limits of the map. This will help to display the map
         # with the correct axis ticks.
         xmin = map_df.origin[0][0]
@@ -144,6 +190,79 @@ class Map():
                 else:
                     img_array[i,j] = 0
         return img_array
+    
+    def _world_to_map_continuous(self, wx: float, wy: float):
+        """
+        世界坐标 -> 连续栅格坐标（未取整），在 OccupancyGrid 语义下：
+        - (0,0) 栅格中心位于 (origin_x, origin_y)
+        - 若 origin_yaw != 0，会做逆旋转将世界点转回地图坐标轴
+        """
+        m = self.mpInfo
+        # 平移到以 origin 为参考
+        dx = wx - m.origin_x
+        dy = wy - m.origin_y
+
+        # 逆旋转（世界 -> 地图坐标轴）
+        c, s = cos(-m.origin_yaw), sin(-m.origin_yaw)
+        mx_cont = (dx * c - dy * s) / m.resolution
+        my_cont = (dx * s + dy * c) / m.resolution
+
+        # 这里的 (0,0) 意味着第 0 个栅格的中心
+        return mx_cont, my_cont
+
+    def pose_to_grid(self, wx: float, wy: float, clamp: bool = False):
+        """
+        世界坐标(米) -> 栅格索引(int)。
+        默认采用“向下取整到所在格子”的策略：ix = floor(mx_cont + 0.5)
+        因为 (0,0) 指第 0 格中心，所以 +0.5 能把中心对齐到整数格。
+        """
+        m = self.mpInfo
+        mx_cont, my_cont = self._world_to_map_continuous(wx, wy)
+
+        # 把“以格中心为原点”的连续坐标转为“以格索引为整数”
+        ix = int(floor(mx_cont + 0.5))
+        iy = int(floor(my_cont + 0.5))
+
+        # 如果使用图像坐标（y 向下，左上角 0,0）
+        if m.y_down:
+            iy = (m.height - 1) - iy
+
+        if clamp:
+            ix = max(0, min(m.width - 1, ix))
+            iy = max(0, min(m.height - 1, iy))
+
+        # 越界检查（不 clamp 时给出提示）
+        if not clamp and (ix < 0 or ix >= m.width or iy < 0 or iy >= m.height):
+            raise ValueError(f"grid index out of bounds: ({ix}, {iy})")
+
+        return ix, iy
+
+    def grid_to_pose(self, ix: int, iy: int):
+        """
+        栅格索引 -> 世界坐标（返回该格**中心**的世界系 (x,y)）。
+        """
+        m = self.mpInfo
+        if ix < 0 or ix >= m.width or iy < 0 or iy >= m.height:
+            raise ValueError(f"grid index out of bounds: ({ix}, {iy})")
+
+        # 图像坐标转换回常规地图坐标（如有需要）
+        if m.y_down:
+            iy = (m.height - 1) - iy
+
+        # 先得到以地图坐标轴为基的连续坐标（以 0 格中心为 0）
+        mx_cont = float(ix)
+        my_cont = float(iy)
+
+        # 转回以 origin 为参考的米制坐标（先缩放再旋转）
+        dx_local = mx_cont * m.resolution
+        dy_local = my_cont * m.resolution
+
+        # 旋转到世界坐标轴（地图 -> 世界）
+        c, s = cos(m.origin_yaw), sin(m.origin_yaw)
+        wx = m.origin_x + (dx_local * c - dy_local * s)
+        wy = m.origin_y + (dx_local * s + dy_local * c)
+
+        return wx, wy
 
 class MapProcessor():
     def __init__(self,name):
@@ -382,20 +501,22 @@ class PathFinder():
 
     # change the scale of the map, from world to pixel map
     def world_to_pixel(self, x, y, min_x=-5.4, max_y=4.2, scale_x=13.42, scale_y=13.49)->tuple[int,int]:
-        x_origin, y_origin = 73, 56 # sim: 73, 56 
-        resolution = 1/0.075 # sim: 0.075 
-        pixel_x = x_origin + x * resolution
-        pixel_y = y_origin - y * resolution
+        # x_origin, y_origin = 73, 56 # sim: 73, 56 
+        # resolution = 1/0.075 # sim: 0.075 
+        # pixel_x = x_origin + x * resolution
+        # pixel_y = y_origin - y * resolution
         
-        return int(round(pixel_x)), int(round(pixel_y))
+        # return int(round(pixel_x)), int(round(pixel_y))
+        return self.mp.map.pose_to_grid(x, y)
     
     def pixel_to_world(self, pixel_x, pixel_y, min_x=-5.4, max_y=4.2, scale_x=0.0745, scale_y=0.0741)->tuple:
-        x_origin, y_origin = 72, 56 
-        resolution = 1/0.075 
-        world_x = (pixel_x - x_origin) / resolution
-        world_y = (y_origin - pixel_y) / resolution
+        # x_origin, y_origin = 72, 56 
+        # resolution = 1/0.075 
+        # world_x = (pixel_x - x_origin) / resolution
+        # world_y = (y_origin - pixel_y) / resolution
 
-        return world_x, world_y
+        # return world_x, world_y
+        return self.mp.map.grid_to_pose(pixel_x, pixel_y)
 
     def build_a_pose(self, world_x, world_y):
         pose = PoseStamped()
@@ -418,7 +539,7 @@ class PathFinder():
         self.mp.map_graph.root = str(start_pose_pixel[1]) + ',' + str(start_pose_pixel[0])
         self.mp.map_graph.end = str(end_pose_pixel[1]) + ',' + str(end_pose_pixel[0])
         self.node.get_logger().info('Start: {}, End: {}'.format(self.mp.map_graph.root, self.mp.map_graph.end))
-        self.node.get_logger().info('Start: {}, End: {}'.format(self.mp.map_graph.root, self.mp.map_graph.end))
+        #self.node.get_logger().info('Start: {}, End: {}'.format(self.mp.map_graph.root, self.mp.map_graph.end))
         
         as_maze = AStar(self.mp.map_graph)
         as_maze.solve(self.mp.map_graph.g[self.mp.map_graph.root],self.mp.map_graph.g[self.mp.map_graph.end])
