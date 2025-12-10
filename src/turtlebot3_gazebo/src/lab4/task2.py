@@ -566,10 +566,12 @@ class PathFinder():
             return self.dynamic_costmap[i, j] != 0
 
         as_maze = AStar(self.mp.map_graph, is_blocked=is_blocked)
+        start = time.time()
         as_maze.solve(self.mp.map_graph.g[self.mp.map_graph.root],self.mp.map_graph.g[self.mp.map_graph.end])
+        self.node.get_logger().info('A* time: {:.4f} seconds'.format(time.time() - start))
         path_as,dist_as = as_maze.reconstruct_path(self.mp.map_graph.g[self.mp.map_graph.root],self.mp.map_graph.g[self.mp.map_graph.end])
         
-        self.node.get_logger().info('Path: {}'.format(path_as))
+        #self.node.get_logger().info('Path: {}'.format(path_as))
         
         for node in path_as:
             world_x, world_y = self.pixel_to_world(int(node.split(',')[1]), int(node.split(',')[0]))
@@ -637,8 +639,25 @@ class Navigation(rclpy_node):
         self.PathFinder = PathFinder(self, map_name)
         
         #Implement the PID controller
-        self.speed_pid = PID(0.3, 0.001, 0.0005, 0.35, 0.2, 0.15)
-        self.heading_pid = PID(0.3, 0, 0, 0.1, 0.2, 0.03)
+        # self.speed_pid = PID(0.3, 0.001, 0.0005, 0.35, 0.2, 0.15)
+        # self.heading_pid = PID(0.3, 0, 0, 0.1, 0.2, 0.03)
+        self.speed_pid = PID(
+            kp=0.5,      # 提高比例增益
+            ki=0.002,    # 稍微增大积分
+            kd=0.001,    # 稍微增大微分
+            setpoint=0.35,
+            integral_separation_threshold=0.2,
+            deadband=0.1  # 减小死区，更早开始移动
+        )
+        
+        self.heading_pid = PID(
+            kp=0.6,      # 提高转向响应
+            ki=0.01,     # 加入小的积分项
+            kd=0.02,     # 加入微分项减少震荡
+            setpoint=0.1,
+            integral_separation_threshold=0.2,
+            deadband=0.02
+        )
         
         self.is_goal_set = False
 
@@ -651,8 +670,7 @@ class Navigation(rclpy_node):
         @return None.
         """
         self.goal_pose = data
-        self.get_logger().info(
-            'goal_pose: {:.4f}, {:.4f}'.format(self.goal_pose.pose.position.x, self.goal_pose.pose.position.y))
+        self.get_logger().info('goal_pose: {:.4f}, {:.4f}'.format(self.goal_pose.pose.position.x, self.goal_pose.pose.position.y))
         self.is_goal_set = True
 
     def __ttbot_pose_cbk(self, data):
@@ -661,8 +679,7 @@ class Navigation(rclpy_node):
         @return None.
         """
         self.ttbot_pose = data.pose
-        self.get_logger().info(
-            'ttbot_pose: {:.4f}, {:.4f}'.format(self.ttbot_pose.pose.position.x, self.ttbot_pose.pose.position.y))
+        #self.get_logger().info('ttbot_pose: {:.4f}, {:.4f}'.format(self.ttbot_pose.pose.position.x, self.ttbot_pose.pose.position.y))
         
     def __laser_cbk(self, msg: LaserScan):
         """根据激光雷达数据更新动态 costmap（PathFinder.dynamic_costmap）"""
@@ -809,8 +826,8 @@ class Navigation(rclpy_node):
             if dist > lookahead_distance:
                 idx = i
                 break
-
-        idx = min(idx, len(path.poses) - 1)
+        else:
+            idx = min(idx, len(path.poses) - 1)
         return idx
 
     def path_follower(self, vehicle_pose, current_goal_pose, max_speed = 0.5):
@@ -850,7 +867,7 @@ class Navigation(rclpy_node):
             cmd_vel.angular.z = heading
             cmd_vel.linear.x = 0.0
         else:
-            cmd_vel.angular.z = 0.0
+            cmd_vel.angular.z = heading
             cmd_vel.linear.x = speed
 
         self.cmd_vel_pub.publish(cmd_vel)
@@ -873,7 +890,8 @@ class Navigation(rclpy_node):
         goal_dx = self.goal_pose.pose.position.x - self.ttbot_pose.pose.position.x
         goal_dy = self.goal_pose.pose.position.y - self.ttbot_pose.pose.position.y
         goal_dist = np.hypot(goal_dx, goal_dy)
-        if goal_dist < 0.1:  # 10cm 以内认为到达
+        if goal_dist < 0.3:  # 10cm 以内认为到达
+            self.get_logger().info('Goal reached! Distance: {:.3f}m'.format(goal_dist))
             self.move_ttbot(0.0, 0.0)
             return
 
@@ -886,8 +904,11 @@ class Navigation(rclpy_node):
 
         if need_replan:
             path = self.a_star_path_planner(self.ttbot_pose, self.goal_pose)
-            self._current_path = path
-            self._last_plan_time = now
+            if(len(path.poses) <= 2): ## 非常粗糙的修改，后续最好改为异常处理
+                self.get_logger().info('No path found to the goal!')
+            else:
+                self._current_path = path
+                self._last_plan_time = now
 
         # 5. 按当前路径跟踪
         path = self._current_path
@@ -903,7 +924,7 @@ class Navigation(rclpy_node):
         @param none
         @return none
         """
-        self.timer = self.create_timer(0.1, self._loop_once)
+        self.timer = self.create_timer(0.05, self._loop_once)
         rclpy.spin(self)
 
 
