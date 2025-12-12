@@ -4,6 +4,7 @@ import os
 import numpy as np
 import rclpy
 from rclpy.node import Node as rclpy_node
+from rclpy.duration import Duration
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Pose, Twist
 from std_msgs.msg import Float32
@@ -11,6 +12,10 @@ from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
+
+from tf2_ros import Buffer, TransformListener
+import tf2_py
+from geometry_msgs.msg import TransformStamped
 
 import ament_index_python.packages
 import time
@@ -20,7 +25,10 @@ from copy import copy
 from PIL import Image, ImageOps
 import numpy as np
 import yaml
-import pandas as pd
+import pandas as pd    
+from collections import deque
+
+import numpy as np
 
 class Queue():
     def __init__(self, init_queue = []):
@@ -511,6 +519,16 @@ class PathFinder():
         self.node.get_logger().info('Map: ' + map_name + 'loaded.')
 
         self.dynamic_costmap = np.zeros_like(self.mp.inf_map_img_array, dtype=np.uint8)
+        # 动态障碍多帧确认计数器
+        self.dynamic_confirm = np.zeros_like(self.mp.inf_map_img_array, dtype=np.uint8)
+
+        # 参数（你可以调）
+        self.confirm_frames = 3      # 连续命中 3 帧才算障碍
+        self.decay_per_frame = 1     # 每帧衰减 1（没命中则减少）
+        self.hit_increment = 2       # 命中时增加 2（快一点确认）
+        self.inflation_radius = 3        # 动态障碍膨胀半径（格）
+        self.inflation_add = 1           # 膨胀圈每格 +1（比中心弱）
+
 
 
     # change the scale of the map, from world to pixel map
@@ -547,11 +565,49 @@ class PathFinder():
 
         start_pose_ = self.build_a_pose(start_pose.pose.position.x, start_pose.pose.position.y)
         path.poses.append(start_pose_)
+        ##Fixed important bug
+        # world → pixel（强制 clamp，防越界）
+        si, sj = self.world_to_pixel(
+            start_pose.pose.position.x,
+            start_pose.pose.position.y,
+            clamp=True
+        )
+        gi, gj = self.world_to_pixel(
+            end_pose.pose.position.x,
+            end_pose.pose.position.y,
+            clamp=True
+        )
 
-        start_pose_pixel = self.world_to_pixel(start_pose.pose.position.x, start_pose.pose.position.y)
-        end_pose_pixel = self.world_to_pixel(end_pose.pose.position.x, end_pose.pose.position.y)
-        self.mp.map_graph.root = str(start_pose_pixel[1]) + ',' + str(start_pose_pixel[0])
-        self.mp.map_graph.end = str(end_pose_pixel[1]) + ',' + str(end_pose_pixel[0])
+        # 注意：map_graph 用的是 "row,col" = "i,j"
+        start_ij = (sj, si)
+        goal_ij  = (gj, gi)
+
+        # ---- 修正起点 ----
+        if (self.dynamic_costmap[start_ij] != 0 or
+            self.mp.inf_map_img_array[start_ij] != 0):
+            fixed = self.find_nearest_free_cell(start_ij)
+            if fixed is None:
+                raise ValueError("No free start cell found")
+            self.node.get_logger().warn(
+                f"Start blocked, moved from {start_ij} to {fixed}"
+            )
+            start_ij = fixed
+
+        # ---- 修正终点 ----
+        if (self.dynamic_costmap[goal_ij] != 0 or
+            self.mp.inf_map_img_array[goal_ij] != 0):
+            fixed = self.find_nearest_free_cell(goal_ij)
+            if fixed is None:
+                raise ValueError("No free goal cell found")
+            self.node.get_logger().warn(
+                f"Goal blocked, moved from {goal_ij} to {fixed}"
+            )
+            goal_ij = fixed
+
+        # 写回 graph
+        self.mp.map_graph.root = f"{start_ij[0]},{start_ij[1]}"
+        self.mp.map_graph.end  = f"{goal_ij[0]},{goal_ij[1]}"
+
         self.node.get_logger().info('Start: {}, End: {}'.format(self.mp.map_graph.root, self.mp.map_graph.end))
         #self.node.get_logger().info('Start: {}, End: {}'.format(self.mp.map_graph.root, self.mp.map_graph.end))
         
@@ -570,8 +626,8 @@ class PathFinder():
         as_maze.solve(self.mp.map_graph.g[self.mp.map_graph.root],self.mp.map_graph.g[self.mp.map_graph.end])
         self.node.get_logger().info('A* time: {:.4f} seconds'.format(time.time() - start))
         path_as,dist_as = as_maze.reconstruct_path(self.mp.map_graph.g[self.mp.map_graph.root],self.mp.map_graph.g[self.mp.map_graph.end])
-        
-        #self.node.get_logger().info('Path: {}'.format(path_as))
+        if len(path_as) == 0:
+            raise ValueError('A* failed to find a path!')
         
         for node in path_as:
             world_x, world_y = self.pixel_to_world(int(node.split(',')[1]), int(node.split(',')[0]))
@@ -582,6 +638,148 @@ class PathFinder():
         path.poses.append(end_pose_)
 
         return path
+    def local_replan(self, current_pose, global_path, lookahead_distance=3.0):
+        """
+        局部重规划：仅重新规划机器人周围受影响的区域
+        
+        Args:
+            current_pose: 当前机器人位置
+            global_path: 全局路径
+            lookahead_distance: 局部规划的前瞻距离（米）
+        
+        Returns:
+            融合后的新路径，如果局部规划失败则返回原路径
+        """
+        if not global_path or not global_path.poses:
+            return global_path
+        
+        # 1. 找到当前位置在全局路径中的索引
+        current_x = current_pose.pose.position.x
+        current_y = current_pose.pose.position.y
+        
+        min_dist = float('inf')
+        current_idx = 0
+        for i, pose in enumerate(global_path.poses):
+            dx = pose.pose.position.x - current_x
+            dy = pose.pose.position.y - current_y
+            dist = np.hypot(dx, dy)
+            if dist < min_dist:
+                min_dist = dist
+                current_idx = i
+        
+        # 2. 找到前瞻距离内的路径终点
+        lookahead_idx = current_idx
+        accumulated_dist = 0.0
+        for i in range(current_idx, len(global_path.poses) - 1):
+            p1 = global_path.poses[i]
+            p2 = global_path.poses[i + 1]
+            dx = p2.pose.position.x - p1.pose.position.x
+            dy = p2.pose.position.y - p1.pose.position.y
+            segment_dist = np.hypot(dx, dy)
+            accumulated_dist += segment_dist
+            
+            if accumulated_dist >= lookahead_distance:
+                lookahead_idx = i + 1
+                break
+        else:
+            lookahead_idx = len(global_path.poses) - 1
+        
+        # 3. 检查局部路径段是否有障碍
+        has_obstacle = False
+        for i in range(current_idx, min(lookahead_idx + 1, len(global_path.poses))):
+            pose = global_path.poses[i]
+            px, py = self.world_to_pixel(pose.pose.position.x, pose.pose.position.y, clamp=True)
+            
+            # 检查该点及其周围是否有动态障碍
+            check_radius = 1  # 检查半径
+            for dy in range(-check_radius, check_radius + 1):
+                for dx in range(-check_radius, check_radius + 1):
+                    check_y = py + dy
+                    check_x = px + dx
+                    if (0 <= check_y < self.dynamic_costmap.shape[0] and 
+                        0 <= check_x < self.dynamic_costmap.shape[1]):
+                        if self.dynamic_costmap[check_y, check_x] != 0:
+                            has_obstacle = True
+                            break
+                if has_obstacle:
+                    break
+            if has_obstacle:
+                break
+        
+        # 4. 如果没有障碍，直接返回原路径
+        if not has_obstacle:
+            self.node.get_logger().info('Local path clear, no replanning needed')
+            return global_path
+        
+        # 5. 执行局部重规划
+        self.node.get_logger().info(f'Obstacle detected, local replanning from idx {current_idx} to {lookahead_idx}')
+        
+        local_start_pose = self.build_a_pose(current_x, current_y)
+        local_end_pose = global_path.poses[lookahead_idx]
+        
+        # 局部A*规划
+        local_path = self.find(local_start_pose, local_end_pose)
+        
+        # 6. 融合路径：current -> local_end + 保留后续全局路径
+        if not local_path or len(local_path.poses) < 2:
+            self.node.get_logger().warn('Local replanning failed, keeping original path')
+            return global_path
+        
+        # 构建新路径
+        new_path = Path()
+        new_path.header = global_path.header
+        new_path.header.stamp = self.node.get_clock().now().to_msg()
+        
+        # 添加局部规划的路径（去掉最后一个点，避免重复）
+        new_path.poses.extend(local_path.poses[:-1])
+        
+        # 添加全局路径中lookahead之后的部分
+        new_path.poses.extend(global_path.poses[lookahead_idx:])
+        
+        self.node.get_logger().info(f'Local replan success: {len(local_path.poses)} local + {len(global_path.poses)-lookahead_idx} global waypoints')
+        
+        return new_path
+
+
+    def find_nearest_free_cell(self, start_ij, max_radius=10):
+        """
+        从 start_ij=(i,j) 出发，搜索最近的 free cell
+        使用 BFS，保证最近
+        """
+        h, w = self.dynamic_costmap.shape
+        si, sj = start_ij
+
+        # 如果自己就是 free，直接返回
+        if self.dynamic_costmap[si, sj] == 0 and self.mp.inf_map_img_array[si, sj] == 0:
+            return si, sj
+
+        visited = set()
+        q = deque()
+        q.append((si, sj, 0))
+        visited.add((si, sj))
+
+        while q:
+            i, j, d = q.popleft()
+            if d > max_radius:
+                break
+
+            for di, dj in [(-1,0),(1,0),(0,-1),(0,1),
+                        (-1,-1),(-1,1),(1,-1),(1,1)]:
+                ni, nj = i + di, j + dj
+                if not (0 <= ni < h and 0 <= nj < w):
+                    continue
+                if (ni, nj) in visited:
+                    continue
+
+                # 判定：静态 free + 动态 free
+                if self.dynamic_costmap[ni, nj] == 0 and self.mp.inf_map_img_array[ni, nj] == 0:
+                    return ni, nj
+
+                visited.add((ni, nj))
+                q.append((ni, nj, d + 1))
+
+        return None  # 找不到
+
 
 def euler_from_quaternion(quaternion):
     x, y, z, w = quaternion
@@ -601,6 +799,50 @@ def euler_from_quaternion(quaternion):
     yaw = np.arctan2(t3, t4)
 
     return roll, pitch, yaw
+def quaternion_to_rotation_matrix(qx, qy, qz, qw):
+    """
+    将 quaternion 转成 3x3 旋转矩阵
+    不依赖 tf_transformations
+    """
+    # 归一化（防止数值问题）
+    norm = np.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+    qx, qy, qz, qw = qx/norm, qy/norm, qz/norm, qw/norm
+
+    R = np.array([
+        [1 - 2*(qy*qy + qz*qz),     2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)],
+        [2*(qx*qy + qz*qw),     1 - 2*(qx*qx + qz*qz),     2*(qy*qz - qx*qw)],
+        [2*(qx*qz - qy*qw),         2*(qy*qz + qx*qw), 1 - 2*(qx*qx + qy*qy)]
+    ])
+    return R
+
+def add_hit_with_inflation(conf, static_free, cy, cx, hit_inc, r, add_inc):
+    """
+    在 conf 上对 (cy,cx) 命中做累加，并对半径 r 做膨胀累加。
+    static_free: 静态free掩码（True 表示可通行）
+    """
+    h, w = conf.shape
+
+    def sat_add(y, x, inc):
+        v = int(conf[y, x]) + int(inc)
+        conf[y, x] = 255 if v > 255 else v
+
+    # 中心
+    if 0 <= cy < h and 0 <= cx < w and static_free[cy, cx]:
+        sat_add(cy, cx, hit_inc)
+
+    # 膨胀圈（简单方形，你也可以换成圆形条件 dx*dx+dy*dy<=r*r）
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            ny, nx = cy + dy, cx + dx
+            if not (0 <= ny < h and 0 <= nx < w):
+                continue
+            if not static_free[ny, nx]:
+                continue
+            if dy == 0 and dx == 0:
+                continue
+            # 可选：用圆形膨胀
+            # if dx*dx + dy*dy > r*r: continue
+            sat_add(ny, nx, add_inc)
 
 class Navigation(rclpy_node):
     """! Navigation node class.
@@ -663,7 +905,12 @@ class Navigation(rclpy_node):
 
         self._current_path = None
         self._last_plan_time = None
-        self.replan_interval = 10
+        self.replan_interval =4
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        self.map_frame = "odom"
+# 常见 scan frame: "base_scan" / "laser" / msg.header.frame_id
     def __goal_pose_cbk(self, data):
         """! Callback to catch the goal pose.
         @param  data    PoseStamped object from RVIZ.
@@ -680,60 +927,79 @@ class Navigation(rclpy_node):
         """
         self.ttbot_pose = data.pose
         #self.get_logger().info('ttbot_pose: {:.4f}, {:.4f}'.format(self.ttbot_pose.pose.position.x, self.ttbot_pose.pose.position.y))
-        
+
     def __laser_cbk(self, msg: LaserScan):
-        """根据激光雷达数据更新动态 costmap（PathFinder.dynamic_costmap）"""
-        # 1. 没有定位信息就先不更新
         if self.ttbot_pose is None:
             return
 
-        # 2. 清空上一帧的动态障碍（简单做法：每帧重置）
+        scan_frame = msg.header.frame_id  # 很重要：不要假设
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                msg.header.frame_id,
+                rclpy.time.Time(),   # ✅ 用最新可用，而不是 msg.header.stamp
+                timeout=Duration(seconds=0.05)
+            )
+
+        except Exception as e:
+            self.get_logger().warn(f"TF lookup failed: {e}")
+            return
+        t = tf.transform.translation
+        q = tf.transform.rotation
+        # 把 TF 转成 4x4 矩阵
+        R = quaternion_to_rotation_matrix(q.x, q.y, q.z, q.w)  # 3x3
+
+        T = np.eye(4, dtype=np.float64)                     
+        T[0:3, 0:3] = R
+        T[0, 3] = float(t.x)
+        T[1, 3] = float(t.y)
+        T[2, 3] = float(t.z)
+
+
+        # ---- 多帧确认版本里，你可以在这里先做 conf 衰减 ----
         dyn = self.PathFinder.dynamic_costmap
-        dyn.fill(0)
+        conf = self.PathFinder.dynamic_confirm
+        static = self.PathFinder.mp.inf_map_img_array
 
-        # 3. 机器人当前位姿（map 坐标系下）
-        rx = self.ttbot_pose.pose.position.x
-        ry = self.ttbot_pose.pose.position.y
-        q = self.ttbot_pose.pose.orientation
-        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        static_free = (static == 0)
+            # 衰减
+        dp = self.PathFinder.decay_per_frame
+        conf[:] = np.where(conf > dp, conf - dp, 0).astype(np.uint8)
 
-        # 4. 遍历每一条激光束
         angle = msg.angle_min
         for r in msg.ranges:
-            # 距离合法性检查
-            if np.isinf(r) or np.isnan(r):
-                angle += msg.angle_increment
-                continue
-            if r < msg.range_min or r > msg.range_max:
+            if np.isinf(r) or np.isnan(r) or r < msg.range_min or r > msg.range_max:
                 angle += msg.angle_increment
                 continue
 
-            # 激光坐标系下的点（假设雷达和 base_link 重合，且在机器人中心）
-            x_l = r * np.cos(angle)
-            y_l = r * np.sin(angle)
+            x_s = r * np.cos(angle)
+            y_s = r * np.sin(angle)
 
-            # 旋转 + 平移到 map/world 坐标系
-            x_w = rx + np.cos(yaw) * x_l - np.sin(yaw) * y_l
-            y_w = ry + np.sin(yaw) * x_l + np.cos(yaw) * y_l
+            p = np.array([x_s, y_s, 0.0, 1.0], dtype=np.float64)
+            pw = T @ p
+            x_w, y_w = float(pw[0]), float(pw[1])
 
-            # world -> 像素坐标（列=像素 x，行=像素 y）
-            pix_x, pix_y = self.PathFinder.world_to_pixel(x_w, y_w,True)
+            pix_x, pix_y = self.PathFinder.world_to_pixel(x_w, y_w, clamp=True)
 
-            # 写入 dynamic_costmap （注意索引 [row, col] = [y, x]）
-            if 0 <= pix_y < dyn.shape[0] and 0 <= pix_x < dyn.shape[1]:
-                dyn[pix_y, pix_x] = 1
-
-                # ---------- 可选：简单膨胀一圈 ----------
-                inflation = 5   # 半径 1 cell，可自行调大
-                for dy in range(-inflation, inflation + 1):
-                    for dx in range(-inflation, inflation + 1):
-                        ny, nx = pix_y + dy, pix_x + dx
-                        if 0 <= ny < dyn.shape[0] and 0 <= nx < dyn.shape[1]:
-                            dyn[ny, nx] = 1
-                # ---------------------------------------
+            # ✅ 只在静态free区域才当作动态障碍候选（避免把墙写进动态层）
+            if static_free[pix_y, pix_x]:
+                add_hit_with_inflation(
+                    conf=conf,
+                    static_free=static_free,
+                    cy=pix_y,
+                    cx=pix_x,
+                    hit_inc=self.PathFinder.hit_increment,
+                    r=self.PathFinder.inflation_radius,
+                    add_inc=self.PathFinder.inflation_add
+                )
 
             angle += msg.angle_increment
+
+        # ---- 4) 阈值化输出 dyn（二值给A*用）----
+        dyn[:] = (conf >= self.PathFinder.confirm_frames).astype(np.uint8)
+
         self.publish_dynamic_costmap_markers()
+
     def publish_dynamic_costmap_markers(self):
         dyn = self.PathFinder.dynamic_costmap
         h, w = dyn.shape
@@ -809,7 +1075,7 @@ class Navigation(rclpy_node):
         # TODO: IMPLEMENT A MECHANISM TO DECIDE WHICH POINT IN THE PATH TO FOLLOW idx <= len(path)
 
         min_dist = float('inf')
-        lookahead_distance = 0.3  
+        lookahead_distance = 0.5  
         current_pos = np.array([vehicle_pose.pose.position.x, vehicle_pose.pose.position.y])
         for i, pose in enumerate(path.poses):
             waypoint = np.array([pose.pose.position.x, pose.pose.position.y])
@@ -893,6 +1159,8 @@ class Navigation(rclpy_node):
         if goal_dist < 0.3:  # 10cm 以内认为到达
             self.get_logger().info('Goal reached! Distance: {:.3f}m'.format(goal_dist))
             self.move_ttbot(0.0, 0.0)
+            self.goal_pose = None
+            self._current_path = None   
             return
 
         # 4. 周期性重规划（利用最新 amcl_pose + costmap）
@@ -903,12 +1171,27 @@ class Navigation(rclpy_node):
             need_replan = dt > self.replan_interval
 
         if need_replan:
-            path = self.a_star_path_planner(self.ttbot_pose, self.goal_pose)
-            if(len(path.poses) <= 2): ## 非常粗糙的修改，后续最好改为异常处理
-                self.get_logger().info('No path found to the goal!')
-            else:
-                self._current_path = path
-                self._last_plan_time = now
+            self.move_ttbot(0.0, 0.0) # stop before replan  
+            try:
+                path = self.PathFinder.local_replan(
+                    self.ttbot_pose, 
+                    self._current_path,
+                    lookahead_distance=2
+                )
+                if(len(path.poses) <= 2): ## 非常粗糙的修改，后续最好改为异常处理
+                    self.get_logger().info('No path found to the goal! Replanning in 2 seconds.')
+                    self._last_plan_time = now - Duration(seconds=2.0) 
+                else:
+                    self._current_path = path
+                    self._last_plan_time = now
+                    self.path_pub.publish(path)
+            
+            except Exception as e:
+                self.get_logger().info('Exception occurred while planning path: {}'.format(e))
+                self._last_plan_time = now - Duration(seconds=2.0)
+            # 执行局部重规划
+            
+            
 
         # 5. 按当前路径跟踪
         path = self._current_path
