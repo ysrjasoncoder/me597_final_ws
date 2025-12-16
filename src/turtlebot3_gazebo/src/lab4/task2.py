@@ -513,7 +513,7 @@ class PathFinder():
         map_yaml_path = os.path.join(package_share_directory, 'maps', map_name + '.yaml')
         self.node = node
         self.mp = MapProcessor(map_yaml_path)
-        kr = self.mp.rect_kernel(9,1) # sim: 10
+        kr = self.mp.rect_kernel(10,1) # sim: 10
         self.mp.inflate_map(kr,True)
         self.mp.get_graph_from_map()
         self.node.get_logger().info('Map: ' + map_name + 'loaded.')
@@ -526,7 +526,7 @@ class PathFinder():
         self.confirm_frames = 3      # 连续命中 3 帧才算障碍
         self.decay_per_frame = 1     # 每帧衰减 1（没命中则减少）
         self.hit_increment = 2       # 命中时增加 2（快一点确认）
-        self.inflation_radius = 3        # 动态障碍膨胀半径（格）
+        self.inflation_radius = 2        # 动态障碍膨胀半径（格）
         self.inflation_add = 1           # 膨胀圈每格 +1（比中心弱）
 
 
@@ -690,20 +690,23 @@ class PathFinder():
             pose = global_path.poses[i]
             px, py = self.world_to_pixel(pose.pose.position.x, pose.pose.position.y, clamp=True)
             
-            # 检查该点及其周围是否有动态障碍
-            check_radius = 1  # 检查半径
-            for dy in range(-check_radius, check_radius + 1):
-                for dx in range(-check_radius, check_radius + 1):
-                    check_y = py + dy
-                    check_x = px + dx
-                    if (0 <= check_y < self.dynamic_costmap.shape[0] and 
-                        0 <= check_x < self.dynamic_costmap.shape[1]):
-                        if self.dynamic_costmap[check_y, check_x] != 0:
-                            has_obstacle = True
-                            break
-                if has_obstacle:
-                    break
-            if has_obstacle:
+            # # 检查该点及其周围是否有动态障碍
+            # check_radius = 1  # 检查半径
+            # for dy in range(-check_radius, check_radius + 1):
+            #     for dx in range(-check_radius, check_radius + 1):
+            #         check_y = py + dy
+            #         check_x = px + dx
+            #         if (0 <= check_y < self.dynamic_costmap.shape[0] and 
+            #             0 <= check_x < self.dynamic_costmap.shape[1]):
+            #             if self.dynamic_costmap[check_y, check_x] != 0:
+            #                 has_obstacle = True
+            #                 break
+            #     if has_obstacle:
+            #         break
+            # if has_obstacle:
+            #     break
+            if self.dynamic_costmap[py, px] != 0:
+                has_obstacle = True
                 break
         
         # 4. 如果没有障碍，直接返回原路径
@@ -1065,36 +1068,206 @@ class Navigation(rclpy_node):
         self.path_pub.publish(path)
         return path
 
-    def get_path_idx(self, path, vehicle_pose):
-        """! Path follower.
-        @param  path                  Path object containing the sequence of waypoints of the created path.
-        @param  current_goal_pose     PoseStamped object containing the current vehicle position.
-        @return idx                   Position in the path pointing to the next goal pose to follow.
+    def _pose_xy(self, pose):
+        return np.array([pose.pose.position.x, pose.pose.position.y], dtype=np.float64)
+
+    def _project_point_to_segment(self, p, a, b):
+        ab = b - a
+        denom = float(np.dot(ab, ab))
+        if denom < 1e-12:
+            return a, 0.0
+        t = float(np.dot(p - a, ab) / denom)
+        t = max(0.0, min(1.0, t))
+        proj = a + t * ab
+        return proj, t
+
+    def _turn_angle_at(self, path, k):
         """
-        idx = 0
-        # TODO: IMPLEMENT A MECHANISM TO DECIDE WHICH POINT IN THE PATH TO FOLLOW idx <= len(path)
+        返回路径在 k 处的转角（弧度），k 是 waypoint 索引
+        用 (k-1)->k 和 k->(k+1) 的夹角衡量拐角程度
+        """
+        n = len(path.poses)
+        if k <= 0 or k >= n - 1:
+            return 0.0
+        p0 = self._pose_xy(path.poses[k-1])
+        p1 = self._pose_xy(path.poses[k])
+        p2 = self._pose_xy(path.poses[k+1])
+        v1 = p1 - p0
+        v2 = p2 - p1
+        n1 = float(np.linalg.norm(v1))
+        n2 = float(np.linalg.norm(v2))
+        if n1 < 1e-9 or n2 < 1e-9:
+            return 0.0
+        c = float(np.dot(v1, v2) / (n1 * n2))
+        c = max(-1.0, min(1.0, c))
+        return float(np.arccos(c))  # 0=直线，越大越拐
 
-        min_dist = float('inf')
-        lookahead_distance = 0.5  
-        current_pos = np.array([vehicle_pose.pose.position.x, vehicle_pose.pose.position.y])
-        for i, pose in enumerate(path.poses):
-            waypoint = np.array([pose.pose.position.x, pose.pose.position.y])
-            dist = np.linalg.norm(waypoint - current_pos)
-            
-            if dist < min_dist:
-                min_dist = dist
-                idx = i
+    def _segment_hits_obstacle(self, p_world, g_world, step=0.05):
+        """
+        检查 world 直线段 p->g 是否穿过障碍（静态膨胀层或动态层）
+        step: 世界坐标采样间隔（米），建议 0.03~0.08
+        """
+        # 依赖：PathFinder.world_to_pixel、PathFinder.mp.inf_map_img_array、PathFinder.dynamic_costmap
+        p = np.array(p_world, dtype=np.float64)
+        g = np.array(g_world, dtype=np.float64)
+        d = g - p
+        L = float(np.linalg.norm(d))
+        if L < 1e-6:
+            return False
 
-        for i in range(idx, len(path.poses)):
-            waypoint = np.array([path.poses[i].pose.position.x, path.poses[i].pose.position.y])
-            dist = np.linalg.norm(waypoint - current_pos)
-            
-            if dist > lookahead_distance:
-                idx = i
-                break
+        static = self.PathFinder.mp.inf_map_img_array  # 0=free, >0=膨胀障碍
+        dyn = self.PathFinder.dynamic_costmap          # 1=动态障碍
+
+        steps = max(2, int(L / step))
+        for i in range(steps + 1):
+            t = i / steps
+            x = float(p[0] + d[0] * t)
+            y = float(p[1] + d[1] * t)
+            # world->grid（你这里返回的是 (ix,iy)，注意你后面用 pix_y,pix_x 访问数组）
+            ix, iy = self.PathFinder.world_to_pixel(x, y, clamp=True)
+            # 数组索引是 [row=y, col=x]
+            if static[iy, ix] != 0:
+                return True
+            if dyn[iy, ix] != 0:
+                return True
+
+        return False
+    def _reset_tracker_on_new_path(self, path):
+    # 用一个轻量的“路径签名”判断是否真变了
+        n = len(path.poses)
+        if n < 2:
+            self._path_sig = None
+            return
+
+        def xy(i):
+            return (round(path.poses[i].pose.position.x, 3),
+                    round(path.poses[i].pose.position.y, 3))
+
+        sig = (n, xy(0), xy(min(5, n-1)), xy(n-1))
+
+        if getattr(self, "_path_sig", None) != sig:
+            self._path_sig = sig
+            # ✅ 重置跟踪内部状态：让 get_path_idx 重新从机器人附近找段
+            self._path_progress_seg = 0
+            self._lookahead = 0.6
+            self._force_global_search = 8   # 接下来 8 次循环用更稳的全局搜索
+
+
+    def get_path_idx(self, path, vehicle_pose):
+        if path is None or len(path.poses) < 2:
+            return 0
+
+        n = len(path.poses)
+
+        # ---- 可调参数（控制层）----
+        MIN_LH = 0.25
+        MAX_LH = 1.20
+        GROW = 1.15
+        SHRINK = 0.60
+        SAFE_STEP = 0.05
+
+        BIG_TURN = np.deg2rad(35)
+        SMALL_TURN = np.deg2rad(10)
+
+        # 维护可变 lookahead
+        if not hasattr(self, "_lookahead"):
+            self._lookahead = 0.6
+        lh = float(np.clip(self._lookahead, MIN_LH, MAX_LH))
+
+        # 机器人位置
+        p = np.array([vehicle_pose.pose.position.x,
+                    vehicle_pose.pose.position.y], dtype=np.float64)
+
+        # ✅ 永远先定义 last_seg，避免 force 分支未定义
+        last_seg = getattr(self, "_path_progress_seg", 0)
+        last_seg = max(0, min(last_seg, n - 2))
+
+        # 选搜索窗口
+        force = getattr(self, "_force_global_search", 0)
+        if force > 0:
+            seg_start, seg_end = 0, n - 2
+            self._force_global_search = force - 1
         else:
-            idx = min(idx, len(path.poses) - 1)
+            back, ahead = 3, 40
+            seg_start = max(0, last_seg - back)
+            seg_end   = min(n - 2, last_seg + ahead)
+
+        # ---- 1) 找最近投影段 ----
+        best_seg = seg_start
+        best_proj = None
+        best_d2 = float("inf")
+
+        for i in range(seg_start, seg_end + 1):
+            a = self._pose_xy(path.poses[i])
+            b = self._pose_xy(path.poses[i+1])
+            proj, _ = self._project_point_to_segment(p, a, b)
+            d2 = float(np.dot(p - proj, p - proj))
+            if d2 < best_d2:
+                best_d2 = d2
+                best_seg = i
+                best_proj = proj
+
+        # 极端保护（理论不该发生）
+        if best_proj is None:
+            self._path_progress_seg = 0
+            return 0
+
+        # 单调进度（最多允许回退1段）
+        best_seg = max(best_seg, last_seg - 1)
+        self._path_progress_seg = best_seg
+
+        # ---- 2) 转角自适应 ----
+        k = min(n - 2, best_seg + 1)
+        turn = self._turn_angle_at(path, k)
+
+        if turn < SMALL_TURN:
+            lh = min(MAX_LH, lh * GROW)
+        elif turn > BIG_TURN:
+            lh = max(MIN_LH, lh * SHRINK)
+
+        # ---- 3) 从投影点沿路径前进 lookahead ----
+        def advance_idx_from(seg, proj_point, lookahead):
+            remaining = float(lookahead)
+
+            b = self._pose_xy(path.poses[seg+1])
+            dist_to_b = float(np.linalg.norm(b - proj_point))
+            if remaining <= dist_to_b:
+                target = proj_point + (b - proj_point) * (remaining / max(dist_to_b, 1e-9))
+                return seg + 1, target
+
+            remaining -= dist_to_b
+            for j in range(seg + 1, n - 1):
+                p1 = self._pose_xy(path.poses[j])
+                p2 = self._pose_xy(path.poses[j+1])
+                seglen = float(np.linalg.norm(p2 - p1))
+                if seglen < 1e-9:
+                    continue
+                if remaining <= seglen:
+                    t = remaining / seglen
+                    target = p1 + (p2 - p1) * t
+                    return j + 1, target
+                remaining -= seglen
+
+            return n - 1, self._pose_xy(path.poses[-1])
+
+        idx, target_xy = advance_idx_from(best_seg, best_proj, lh)
+
+        # ---- 4) 直线段碰撞检查：不安全就缩短 lookahead ----
+        robot_xy = p
+        while lh > MIN_LH:
+            if not self._segment_hits_obstacle(robot_xy, target_xy, step=SAFE_STEP):
+                break
+            lh = max(MIN_LH, lh * SHRINK)
+            idx, target_xy = advance_idx_from(best_seg, best_proj, lh)
+
+        self._lookahead = lh
+
+        # 末端锁定
+        if idx >= n - 3:
+            return n - 1
+
         return idx
+
 
     def path_follower(self, vehicle_pose, current_goal_pose, max_speed = 0.5):
         """! Path follower.
@@ -1183,6 +1356,7 @@ class Navigation(rclpy_node):
                     self._last_plan_time = now - Duration(seconds=2.0) 
                 else:
                     self._current_path = path
+                    self._reset_tracker_on_new_path(path)
                     self._last_plan_time = now
                     self.path_pub.publish(path)
             
