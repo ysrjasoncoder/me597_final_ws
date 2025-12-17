@@ -1319,6 +1319,7 @@ class Navigation(rclpy_node):
             self.is_goal_set = False
             path = self.a_star_path_planner(self.ttbot_pose, self.goal_pose)
             self._current_path = path
+            self._reset_tracker_on_new_path(path)
             self._last_plan_time = now
 
         # 2. 没有 goal 就啥也不干

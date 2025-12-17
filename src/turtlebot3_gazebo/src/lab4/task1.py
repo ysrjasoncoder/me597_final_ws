@@ -116,7 +116,7 @@ class RightWallFollower(Node):
         if now - self.start_time > self.run_seconds:
             stop_twist = Twist()
             self.cmd_pub.publish(stop_twist)
-            self.save_map("syn_classroom")
+            self.save_map("map")
             return
 
         if self.last_scan is None:
@@ -160,7 +160,7 @@ class RightWallFollower(Node):
         if math.isfinite(front_min) and front_min < self.d_front_stop and math.isfinite(front_mean) and 1.5 * front_min > self.d_front_stop:
             error_front = self.d_front_stop - front_min
             ang_front = self.kp_front * error_front
-            ang = 0.7
+            ang = 0.5
         else:
         # 2.1 右手贴墙：right_min 与期望距离的误差
             if math.isfinite(right_min):
